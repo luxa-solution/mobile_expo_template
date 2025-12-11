@@ -1,9 +1,10 @@
-# .github/workflows/eas-build.yml
 name: EAS Build
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - 'hotfix/*'
     tags:
       - "v*"
   workflow_dispatch:

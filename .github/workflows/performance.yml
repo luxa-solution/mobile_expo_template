@@ -1,17 +1,73 @@
-# .github/workflows/performance.yml
 name: Performance Monitoring
 
 on:
-  pull_request:
-    branches: [main, develop]
-  push:
-    branches: [main]
+  push: 
+    branches: 
+      - main
   schedule:
     - cron: "0 0 * * 0" # Weekly on Sunday
+  pull_request: # Trigger directly on PR events for visible checks
+    types: [opened, synchronize, reopened]
+    branches:
+      - develop
+      - staging
+      - main
 
 jobs:
+  wait-for-branch-guard:
+    name: Wait for Branch Guard
+    runs-on: ubuntu-latest
+    permissions:
+      checks: read
+      contents: read
+    steps:
+      - name: Skip for non-PR events
+        if: github.event_name != 'pull_request'
+        run: echo "Non-PR event; skipping branch guard wait."
+
+      - name: Wait for PR Branch Guard
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const sha = context.payload.pull_request.head.sha;
+            const checkName = 'branch-guard';
+            const maxTries = 30;
+            const delayMs = 10000;
+            const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+            for (let attempt = 1; attempt <= maxTries; attempt++) {
+              const { data } = await github.rest.checks.listForRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: sha,
+                check_name: checkName,
+              });
+
+              const run = data.check_runs.find(r => r.name === checkName);
+
+              if (run && run.status === 'completed') {
+                if (run.conclusion === 'success') {
+                  core.info('Branch guard passed.');
+                  return;
+                }
+
+                core.setFailed(`Branch guard ${run.conclusion}`);
+                return;
+              }
+
+              core.info(`Branch guard not finished (try ${attempt}/${maxTries}); waiting ${delayMs / 1000}s`);
+              await sleep(delayMs);
+            }
+
+            core.setFailed('Branch guard did not complete in time.');
+
   performance-metrics:
     name: React Native Performance
+    # Only run on successful guard check OR non-PR events (push, schedule)
+    if: github.event_name != 'pull_request' || needs.wait-for-branch-guard.result == 'success'
+    needs: wait-for-branch-guard
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -19,7 +75,20 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
 
+      - name: Get PR number
+        if: github.event_name == 'pull_request' 
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = context.payload.pull_request;
+            core.setOutput('number', pr.number);
+            core.info(`Found PR #${pr.number}`);
+            
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -47,7 +116,6 @@ jobs:
       - name: Analyze dependencies
         id: deps
         run: |
-          # Count dependencies
           TOTAL_DEPS=$(pnpm list --depth=Infinity --json | jq '[.. | .dependencies? | select(. != null) | keys] | add | unique | length')
           DIRECT_DEPS=$(cat package.json | jq '.dependencies | length')
           DEV_DEPS=$(cat package.json | jq '.devDependencies | length')
@@ -59,30 +127,23 @@ jobs:
       - name: Check for heavy dependencies
         id: heavy
         run: |
-          # List packages larger than 1MB
-          pnpm list --depth=Infinity --json | jq -r '
-            .. | .dependencies? | select(. != null) | 
-            to_entries[] | 
-            "\(.key)@\(.value.version // "unknown")"
-          ' | sort -u > all-deps.txt
-
           echo "Heavy dependencies:" > heavy-deps.txt
           du -sh node_modules/* | sort -rh | head -10 >> heavy-deps.txt
 
       - name: Calculate startup metrics
         id: startup
         run: |
-          # Measure JS bundle parsing time (approximation)
-          START_TIME=$(node -e "console.time('startup'); require('./App.tsx'); console.timeEnd('startup')" 2>&1 | grep startup || echo "startup: 0ms")
+          START_TIME=$(node -e "console.time('startup'); try { require('./App.tsx'); } catch(e) {} console.timeEnd('startup')" 2>&1 | grep startup || echo "startup: 0ms")
           echo "startup_time=$START_TIME" >> $GITHUB_OUTPUT
 
       - name: Comment performance metrics
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' 
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
+            const prNumber = parseInt('${{ github.event.pull_request.number }}');
             const heavyDeps = fs.readFileSync('heavy-deps.txt', 'utf8');
 
             const comment = `## 📊 Performance Metrics
@@ -109,7 +170,7 @@ jobs:
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
+              issue_number: prNumber,
             });
 
             const botComment = comments.find(comment => 
@@ -128,17 +189,22 @@ jobs:
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                issue_number: context.issue.number,
+                issue_number: prNumber,
                 body: comment
               });
             }
 
   react-native-profiling:
     name: React Native Profiling
+    # Only run on successful guard check OR non-PR events (push, schedule)
+    if: github.event_name != 'pull_request' || needs.wait-for-branch-guard.result == 'success'
+    needs: wait-for-branch-guard
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -187,7 +253,7 @@ jobs:
       - name: Upload profiling results
         uses: actions/upload-artifact@v4
         with:
-          name: performance-profiling
+          name: performance-profiling-${{ github.sha }}
           path: |
             *-count.txt
             heavy-deps.txt

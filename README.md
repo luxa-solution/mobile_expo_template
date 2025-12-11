@@ -1,4 +1,4 @@
-# Refil Mobile
+# Template React Native Expo App
 
 A React Native mobile application built with Expo, featuring multi-language support and a modern UI framework.
 
